@@ -320,18 +320,19 @@ def validate_rules(rules: list[dict[str, Any]], settings: Settings) -> None:
         validate_rule(rule, settings)
 
 
-def is_publishable(rules: list[dict[str, Any]], min_confidence: float) -> tuple[bool, str]:
-    low_confidence = [
-        f"{rule['pattern']} ({rule['confidence_score']})"
-        for rule in rules
-        if float(rule["confidence_score"]) < min_confidence
-    ]
-    if low_confidence:
-        return False, (
-            "Se detectaron reglas con confianza menor al umbral: "
-            + ", ".join(low_confidence[:5])
-        )
-    return True, ""
+def split_rules_by_confidence(
+    rules: list[dict[str, Any]], min_confidence: float
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    publishable_rules: list[dict[str, Any]] = []
+    discarded_rules: list[dict[str, Any]] = []
+
+    for rule in rules:
+        if float(rule["confidence_score"]) < min_confidence:
+            discarded_rules.append(rule)
+        else:
+            publishable_rules.append(rule)
+
+    return publishable_rules, discarded_rules
 
 
 def save_backup(rules: list[dict[str, Any]], output_dir: Path) -> Path:
@@ -413,19 +414,29 @@ def run_once(settings: Settings) -> RunSummary:
     rules = generate_rules_with_llm(payload, settings)
     validate_rules(rules, settings)
 
-    publishable, reason = is_publishable(rules, settings.min_confidence_autopublish)
-    if not publishable:
+    backup_path = save_backup(rules, settings.output_dir)
+    publishable_rules, discarded_rules = split_rules_by_confidence(
+        rules, settings.min_confidence_autopublish
+    )
+
+    if not publishable_rules:
+        discarded_preview = ", ".join(
+            f"{rule['pattern']} ({rule['confidence_score']})"
+            for rule in discarded_rules[:5]
+        )
         return RunSummary(
             estado="error",
             hubo_cambios="si",
             reglas_generadas=len(rules),
             reglas_publicadas=0,
-            backup="n/a",
-            observaciones=reason,
+            backup=str(backup_path),
+            observaciones=(
+                "Todas las reglas quedaron por debajo del umbral de confianza. "
+                f"Descartadas: {len(discarded_rules)}. Ejemplos: {discarded_preview}"
+            ),
         )
 
-    backup_path = save_backup(rules, settings.output_dir)
-    published_count = publish_rules(settings, rules)
+    published_count = publish_rules(settings, publishable_rules)
 
     if not settings.dry_run:
         save_state(
@@ -434,7 +445,8 @@ def run_once(settings: Settings) -> RunSummary:
                 "source_hash": current_hash,
                 "last_run_utc": datetime.now(timezone.utc).isoformat(),
                 "last_backup": str(backup_path),
-                "rules_count": len(rules),
+                "rules_count": len(publishable_rules),
+                "discarded_rules_count": len(discarded_rules),
                 "rows": rows,
             },
         )
@@ -442,6 +454,15 @@ def run_once(settings: Settings) -> RunSummary:
     observation = (
         f"Cambios detectados. Filas nuevas: {new_rows}. Filas modificadas: {modified_rows}."
     )
+    if discarded_rules:
+        discarded_preview = ", ".join(
+            f"{rule['pattern']} ({rule['confidence_score']})"
+            for rule in discarded_rules[:5]
+        )
+        observation += (
+            f" Se descartaron {len(discarded_rules)} reglas por baja confianza. "
+            f"Ejemplos: {discarded_preview}."
+        )
     if settings.dry_run:
         observation += " DRY_RUN activo; no se publico en la sheet destino."
 
