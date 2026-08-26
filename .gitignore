@@ -6,3 +6,6 @@ output/
 state.json
 logs/
 service_account.json
+config/profiles/
+config/state/
+.cache/

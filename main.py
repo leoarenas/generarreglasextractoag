@@ -1,9 +1,10 @@
+import argparse
 import hashlib
 import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,10 @@ from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from json_repair import repair_json
 from openai import OpenAI
+
+from bank_profiles import load_profile, normalized_file_rows, run_setup_wizard
+from drive_source import fetch_latest_drive_file, load_drive_sources
+from sql_rules import build_connection_string, deduplicate_rules, publish_rules_to_sql
 
 
 ALLOWED_MATCH_TYPES = {
@@ -37,6 +42,13 @@ EXPECTED_COLUMNS = [
     "notes",
 ]
 
+DISCARDED_COLUMNS = EXPECTED_COLUMNS + [
+    "discard_reason",
+    "min_confidence_required",
+    "source_file",
+    "run_utc",
+]
+
 ALLOWED_TX_TYPES = {"credito", "debito", "mixto"}
 
 
@@ -44,10 +56,22 @@ ALLOWED_TX_TYPES = {"credito", "debito", "mixto"}
 class Settings:
     google_service_account_json: str | None
     google_service_account_file: str | None
-    source_spreadsheet_id: str
+    source_spreadsheet_id: str | None
     source_sheet_name: str
-    rules_spreadsheet_id: str
+    source_file: Path | None
+    profile_file: Path | None
+    drive_sources_file: Path | None
+    drive_folder_id: str | None
+    drive_file_pattern: str
+    drive_cache_dir: Path
+    selected_source_name: str | None
+    selected_source_modified_time: str | None
+    pdf_password: str | None
+    rules_spreadsheet_id: str | None
     rules_sheet_name: str
+    sql_publish_enabled: bool
+    sql_connection_string: str | None
+    sql_rules_table: str
     poll_interval_seconds: int
     bank_code: str
     output_dir: Path
@@ -75,19 +99,61 @@ def parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ValueError(f"Falta configurar {name} para publicar en SQL Server.")
+    return value
+
+
 def load_settings() -> Settings:
     load_dotenv()
+    profile_file = Path(os.environ["PROFILE_FILE"]) if os.environ.get("PROFILE_FILE") else None
+    default_output = str(Path("output") / profile_file.stem) if profile_file else "output"
+    default_state = (
+        str(Path("config/state") / f"{profile_file.stem}.json")
+        if profile_file
+        else "state.json"
+    )
     return Settings(
         google_service_account_json=os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"),
         google_service_account_file=os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE"),
-        source_spreadsheet_id=os.environ["SOURCE_SPREADSHEET_ID"],
+        source_spreadsheet_id=os.environ.get("SOURCE_SPREADSHEET_ID"),
         source_sheet_name=os.environ.get("SOURCE_SHEET_NAME", "Hoja 1"),
-        rules_spreadsheet_id=os.environ["RULES_SPREADSHEET_ID"],
+        source_file=Path(os.environ["SOURCE_FILE"]) if os.environ.get("SOURCE_FILE") else None,
+        profile_file=profile_file,
+        drive_sources_file=(
+            Path(os.environ["DRIVE_SOURCES_FILE"])
+            if os.environ.get("DRIVE_SOURCES_FILE")
+            else None
+        ),
+        drive_folder_id=os.environ.get("DRIVE_FOLDER_ID"),
+        drive_file_pattern=os.environ.get("DRIVE_FILE_PATTERN", "*"),
+        drive_cache_dir=Path(os.environ.get("DRIVE_CACHE_DIR", ".cache/drive")),
+        selected_source_name=None,
+        selected_source_modified_time=None,
+        pdf_password=os.environ.get("PDF_PASSWORD"),
+        rules_spreadsheet_id=os.environ.get("RULES_SPREADSHEET_ID"),
         rules_sheet_name=os.environ.get("RULES_SHEET_NAME", "Reglas"),
+        sql_publish_enabled=parse_bool(os.environ.get("SQL_PUBLISH_ENABLED", "true")),
+        sql_connection_string=(
+            build_connection_string(
+                os.environ.get("SQL_SERVER", "vm-srv-sqldev"),
+                os.environ.get("SQL_DATABASE", "Metalnor_Paralelo"),
+                required_env("SQL_USERNAME"),
+                required_env("SQL_PASSWORD"),
+                os.environ.get("SQL_ODBC_DRIVER", "ODBC Driver 18 for SQL Server"),
+                parse_bool(os.environ.get("SQL_ENCRYPT", "true")),
+                parse_bool(os.environ.get("SQL_TRUST_SERVER_CERTIFICATE", "true")),
+            )
+            if parse_bool(os.environ.get("SQL_PUBLISH_ENABLED", "true"))
+            else None
+        ),
+        sql_rules_table=os.environ.get("SQL_RULES_TABLE", "dbo.bank_pattern_rules"),
         poll_interval_seconds=int(os.environ.get("POLL_INTERVAL_SECONDS", "900")),
         bank_code=os.environ.get("BANK_CODE", "macro"),
-        output_dir=Path(os.environ.get("OUTPUT_DIR", "output")),
-        state_file=Path(os.environ.get("STATE_FILE", "state.json")),
+        output_dir=Path(os.environ.get("OUTPUT_DIR", default_output)),
+        state_file=Path(os.environ.get("STATE_FILE", default_state)),
         min_confidence_autopublish=float(
             os.environ.get("MIN_CONFIDENCE_AUTOPUBLISH", "0.85")
         ),
@@ -107,6 +173,7 @@ def load_state(path: Path) -> dict[str, Any]:
 
 
 def save_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
@@ -115,7 +182,7 @@ def hash_rows(rows: list[list[str]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def get_gspread_client(settings: Settings) -> gspread.Client:
+def get_google_credentials(settings: Settings) -> Credentials:
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -127,18 +194,32 @@ def get_gspread_client(settings: Settings) -> gspread.Client:
             credentials_info,
             scopes=scopes,
         )
-        return gspread.authorize(credentials)
+        return credentials
 
     if settings.google_service_account_file:
         credentials = Credentials.from_service_account_file(
             settings.google_service_account_file,
             scopes=scopes,
         )
-        return gspread.authorize(credentials)
+        return credentials
 
     raise ValueError(
         "Falta configurar GOOGLE_SERVICE_ACCOUNT_JSON o GOOGLE_SERVICE_ACCOUNT_FILE."
     )
+
+
+def get_gspread_client(settings: Settings) -> gspread.Client:
+    return gspread.authorize(get_google_credentials(settings))
+
+
+def get_drive_service(settings: Settings) -> Any:
+    try:
+        from googleapiclient.discovery import build
+    except ImportError as exc:
+        raise RuntimeError(
+            "Instale google-api-python-client para acceder a Google Drive."
+        ) from exc
+    return build("drive", "v3", credentials=get_google_credentials(settings), cache_discovery=False)
 
 
 def normalize_cell(value: Any) -> str:
@@ -146,6 +227,45 @@ def normalize_cell(value: Any) -> str:
 
 
 def fetch_source_rows(settings: Settings) -> list[list[str]]:
+    if settings.drive_folder_id:
+        if not settings.profile_file:
+            raise ValueError("Para Google Drive debe configurar PROFILE_FILE.")
+        source, local_path = fetch_latest_drive_file(
+            get_drive_service(settings),
+            settings.drive_folder_id,
+            settings.drive_file_pattern,
+            settings.drive_cache_dir,
+        )
+        settings.selected_source_name = source.name
+        settings.selected_source_modified_time = source.modified_time
+        logging.info(
+            "Archivo mas reciente seleccionado de Drive: %s (modificado %s)",
+            source.name,
+            source.modified_time,
+        )
+        profile = load_profile(settings.profile_file)
+        settings.bank_code = profile["account"]["bank_code"]
+        return normalized_file_rows(
+            local_path,
+            profile,
+            pdf_password=settings.pdf_password,
+        )
+
+    if settings.source_file or settings.profile_file:
+        if not settings.source_file or not settings.profile_file:
+            raise ValueError("Para archivos locales debe configurar SOURCE_FILE y PROFILE_FILE.")
+        profile = load_profile(settings.profile_file)
+        settings.bank_code = profile["account"]["bank_code"]
+        return normalized_file_rows(
+            settings.source_file,
+            profile,
+            pdf_password=settings.pdf_password,
+        )
+
+    if not settings.source_spreadsheet_id:
+        raise ValueError(
+            "Configure SOURCE_FILE y PROFILE_FILE, o bien SOURCE_SPREADSHEET_ID."
+        )
     client = get_gspread_client(settings)
     spreadsheet = client.open_by_key(settings.source_spreadsheet_id)
     worksheet = spreadsheet.worksheet(settings.source_sheet_name)
@@ -361,20 +481,92 @@ def get_or_create_worksheet(
 
 def publish_rules(settings: Settings, rules: list[dict[str, Any]]) -> int:
     if settings.dry_run:
-        logging.info("DRY_RUN activo. No se publican cambios en Google Sheets.")
+        logging.info("DRY_RUN activo. No se publican cambios en SQL Server ni Google Sheets.")
         return 0
 
+    published_count = 0
+    if settings.sql_publish_enabled:
+        if not settings.sql_connection_string:
+            raise ValueError("Falta la configuracion de conexion a SQL Server.")
+        result = publish_rules_to_sql(
+            settings.sql_connection_string,
+            settings.sql_rules_table,
+            settings.bank_code,
+            rules,
+        )
+        published_count = result.synchronized
+        logging.info(
+            "SQL Server sincronizado: insertadas=%s actualizadas=%s inactivadas=%s",
+            result.inserted,
+            result.updated,
+            result.deactivated,
+        )
+
+    if settings.rules_spreadsheet_id:
+        client = get_gspread_client(settings)
+        spreadsheet = client.open_by_key(settings.rules_spreadsheet_id)
+        worksheet = get_or_create_worksheet(
+            spreadsheet,
+            settings.rules_sheet_name,
+            rows=max(len(rules) + 10, 50),
+            cols=len(EXPECTED_COLUMNS),
+        )
+        values = to_sheet_values(rules)
+        worksheet.clear()
+        worksheet.update(values=values, range_name="A1")
+        if not settings.sql_publish_enabled:
+            published_count = len(rules)
+    return published_count
+
+
+def to_discarded_sheet_values(
+    settings: Settings, rules: list[dict[str, Any]]
+) -> list[list[Any]]:
+    run_utc = datetime.now(timezone.utc).isoformat()
+    values: list[list[Any]] = [DISCARDED_COLUMNS]
+    for rule in rules:
+        values.append(
+            [rule[column] for column in EXPECTED_COLUMNS]
+            + [
+                "Confianza inferior al umbral de publicacion",
+                settings.min_confidence_autopublish,
+                settings.selected_source_name or "",
+                run_utc,
+            ]
+        )
+    return values
+
+
+def publish_discarded_rules(settings: Settings, rules: list[dict[str, Any]]) -> int:
+    if settings.dry_run:
+        logging.info("DRY_RUN activo. No se publican reglas descartadas.")
+        return 0
+
+    if not settings.rules_spreadsheet_id:
+        logging.info("RULES_SPREADSHEET_ID no configurado; se omite la hoja de descartadas.")
+        return 0
     client = get_gspread_client(settings)
     spreadsheet = client.open_by_key(settings.rules_spreadsheet_id)
+    title = f"{settings.rules_sheet_name}_descartadas"
     worksheet = get_or_create_worksheet(
         spreadsheet,
-        settings.rules_sheet_name,
+        title,
         rows=max(len(rules) + 10, 50),
-        cols=len(EXPECTED_COLUMNS),
+        cols=len(DISCARDED_COLUMNS),
     )
-    values = to_sheet_values(rules)
     worksheet.clear()
-    worksheet.update(values=values, range_name="A1")
+    worksheet.update(
+        values=to_discarded_sheet_values(settings, rules),
+        range_name="A1",
+    )
+    worksheet.freeze(rows=1)
+    worksheet.format(
+        "A1:N1",
+        {
+            "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9},
+            "textFormat": {"bold": True},
+        },
+    )
     return len(rules)
 
 
@@ -387,9 +579,8 @@ def print_summary(summary: RunSummary) -> None:
     print(f"observaciones: {summary.observaciones}")
 
 
-def run_once(settings: Settings) -> RunSummary:
+def process_rows(settings: Settings, rows: list[list[str]]) -> RunSummary:
     state = load_state(settings.state_file)
-    rows = fetch_source_rows(settings)
     current_hash = hash_rows(rows)
 
     if state.get("source_hash") == current_hash:
@@ -418,6 +609,15 @@ def run_once(settings: Settings) -> RunSummary:
     publishable_rules, discarded_rules = split_rules_by_confidence(
         rules, settings.min_confidence_autopublish
     )
+    original_publishable_count = len(publishable_rules)
+    publishable_rules = deduplicate_rules(publishable_rules)
+    duplicate_rules_count = original_publishable_count - len(publishable_rules)
+    if duplicate_rules_count:
+        logging.warning(
+            "Se omitieron %s reglas duplicadas por bank_code + match_type + pattern.",
+            duplicate_rules_count,
+        )
+    publish_discarded_rules(settings, discarded_rules)
 
     if not publishable_rules:
         discarded_preview = ", ".join(
@@ -448,12 +648,16 @@ def run_once(settings: Settings) -> RunSummary:
                 "rules_count": len(publishable_rules),
                 "discarded_rules_count": len(discarded_rules),
                 "rows": rows,
+                "source_file_name": settings.selected_source_name,
+                "source_modified_time": settings.selected_source_modified_time,
             },
         )
 
     observation = (
         f"Cambios detectados. Filas nuevas: {new_rows}. Filas modificadas: {modified_rows}."
     )
+    if settings.selected_source_name:
+        observation += f" Archivo de Drive: {settings.selected_source_name}."
     if discarded_rules:
         discarded_preview = ", ".join(
             f"{rule['pattern']} ({rule['confidence_score']})"
@@ -463,6 +667,8 @@ def run_once(settings: Settings) -> RunSummary:
             f" Se descartaron {len(discarded_rules)} reglas por baja confianza. "
             f"Ejemplos: {discarded_preview}."
         )
+    if duplicate_rules_count:
+        observation += f" Se consolidaron {duplicate_rules_count} reglas duplicadas."
     if settings.dry_run:
         observation += " DRY_RUN activo; no se publico en la sheet destino."
 
@@ -476,18 +682,62 @@ def run_once(settings: Settings) -> RunSummary:
     )
 
 
-def main() -> None:
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-    settings = load_settings()
+def run_once(settings: Settings) -> RunSummary:
+    return process_rows(settings, fetch_source_rows(settings))
 
-    while True:
+
+def run_drive_sources(settings: Settings) -> list[tuple[str, RunSummary]]:
+    if not settings.drive_sources_file:
+        raise ValueError("Falta configurar DRIVE_SOURCES_FILE.")
+    service = get_drive_service(settings)
+    results: list[tuple[str, RunSummary]] = []
+    for bank in load_drive_sources(settings.drive_sources_file):
+        label = bank["bank_name"]
         try:
-            summary = run_once(settings)
+            source, local_path = fetch_latest_drive_file(
+                service,
+                bank["drive_folder_id"],
+                bank.get("file_pattern", "*"),
+                settings.drive_cache_dir,
+            )
+            rows: list[list[str]] | None = None
+            password_env = bank.get("password_env")
+            password = os.environ.get(password_env) if password_env else None
+            for profile_name in bank["profiles"]:
+                profile_path = Path(profile_name)
+                profile = load_profile(profile_path)
+                profile_rows = normalized_file_rows(
+                    local_path,
+                    profile,
+                    pdf_password=password,
+                )
+                if rows is None:
+                    rows = [profile_rows[0]]
+                elif rows[0] != profile_rows[0]:
+                    raise ValueError(
+                        f"El perfil {profile_path.name} genero un esquema incompatible."
+                    )
+                rows.extend(profile_rows[1:])
+            if rows is None or len(rows) < 2:
+                raise ValueError("No se obtuvieron movimientos de los perfiles configurados.")
+            bank_settings = replace(
+                settings,
+                bank_code=bank["bank_code"],
+                source_file=None,
+                profile_file=None,
+                drive_folder_id=None,
+                selected_source_name=source.name,
+                selected_source_modified_time=source.modified_time,
+                pdf_password=password,
+                state_file=Path("config/state") / f"{bank['bank_code']}.json",
+                output_dir=Path("output") / bank["bank_code"],
+                rules_sheet_name=bank.get(
+                    "rules_sheet_name", f"Reglas_{bank['bank_code']}"
+                ),
+            )
+            summary = process_rows(bank_settings, rows)
         except Exception as exc:
-            logging.exception("Fallo la corrida: %s", exc)
+            logging.exception("Fallo el procesamiento de %s: %s", label, exc)
             summary = RunSummary(
                 estado="error",
                 hubo_cambios="no",
@@ -496,8 +746,64 @@ def main() -> None:
                 backup="n/a",
                 observaciones=str(exc),
             )
+        results.append((label, summary))
+    return results
 
-        print_summary(summary)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Agente local de conciliacion bancaria")
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="Ejecuta el asistente para crear un perfil bancario local.",
+    )
+    parser.add_argument(
+        "--sample-file",
+        type=Path,
+        help="Extracto de muestra para usar con --setup.",
+    )
+    parser.add_argument(
+        "--profiles-dir",
+        type=Path,
+        default=Path("config/profiles"),
+        help="Directorio local donde se guardan los perfiles.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    args = parse_args()
+    if args.setup:
+        profile_path = run_setup_wizard(args.sample_file, args.profiles_dir)
+        print(f"Perfil guardado: {profile_path}")
+        print("Configure PROFILE_FILE con esta ruta y SOURCE_FILE con el extracto a procesar.")
+        return
+
+    settings = load_settings()
+
+    while True:
+        if settings.drive_sources_file:
+            for label, summary in run_drive_sources(settings):
+                print(f"\nbanco: {label}")
+                print_summary(summary)
+        else:
+            try:
+                summary = run_once(settings)
+            except Exception as exc:
+                logging.exception("Fallo la corrida: %s", exc)
+                summary = RunSummary(
+                    estado="error",
+                    hubo_cambios="no",
+                    reglas_generadas=0,
+                    reglas_publicadas=0,
+                    backup="n/a",
+                    observaciones=str(exc),
+                )
+            print_summary(summary)
 
         if settings.run_once:
             break
