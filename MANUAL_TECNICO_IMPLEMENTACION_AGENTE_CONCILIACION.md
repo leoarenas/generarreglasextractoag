@@ -14,6 +14,37 @@ Este documento describe paso a paso como implementar un agente de conciliacion b
 - guarda respaldo local de cada corrida
 - puede ejecutarse en forma manual, local o programada con GitHub Actions
 
+### Configuracion local reutilizable por cliente
+
+Para instalaciones con formatos bancarios diferentes, ejecutar `python main.py --setup`
+en la primera puesta en marcha. El asistente solicita obligatoriamente nombre del banco,
+numero, alias o ultimos cuatro caracteres de la cuenta; tipo de cuenta (por ejemplo,
+Cuenta corriente, Caja de ahorro o Cuenta recaudadora); moneda; y la ruta de un extracto
+de muestra o archivo adjunto disponible localmente. Admite CSV, XLSX, XLSM y PDF con
+texto y tablas detectables. Detecta la
+estructura del archivo, propone el diccionario de columnas, permite corregirlo, presenta
+una vista previa normalizada y guarda un perfil local versionado.
+
+El motor principal recibe siempre el esquema normalizado y no depende de los nombres de
+columnas del banco. Las corridas posteriores usan `SOURCE_FILE` y `PROFILE_FILE`. Un
+cambio de columnas detiene la ejecucion y requiere crear una nueva version del perfil.
+El estado y los respaldos quedan aislados por perfil.
+
+### Lectura automatica desde una carpeta de Google Drive
+
+Cuando se configura `DRIVE_FOLDER_ID`, el agente consulta los archivos ubicados
+directamente en esa carpeta, excluye los enviados a la papelera y los formatos no
+compatibles, aplica `DRIVE_FILE_PATTERN` si fue definido y selecciona el archivo con
+el `modifiedTime` mas reciente. El archivo se descarga temporalmente y se procesa con
+`PROFILE_FILE`. Este origen tiene prioridad sobre `SOURCE_FILE`.
+
+La cuenta de servicio configurada debe tener acceso de lectura a la carpeta. Se
+admiten CSV, XLSX, XLSM, PDF y Google Sheets nativos exportados temporalmente a XLSX.
+
+Las reglas que quedan por debajo del umbral de confianza se registran en
+`Reglas_<bank_code>_descartadas` con el motivo, el umbral requerido, el archivo
+fuente y la fecha de ejecución. No se mezclan con las reglas activas.
+
 El objetivo es reutilizar este procedimiento como base de implementacion para clientes nuevos.
 
 ## 2. Alcance funcional

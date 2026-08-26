@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "banks": [
+    {
+      "bank_code": "macro",
+      "bank_name": "Banco Macro",
+      "enabled": true,
+      "drive_folder_id": "13teQstLoMbgp8H1jkFiO-tHhr42QGCXw",
+      "file_pattern": "*",
+      "password_env": "MACRO_PDF_PASSWORD",
+      "rules_sheet_name": "Reglas_macro",
+      "profiles": [
+        "config/profiles/macro_4023_ars_v1.json",
+        "config/profiles/macro_1644_ars_v1.json"
+      ]
+    }
+  ]
+}
